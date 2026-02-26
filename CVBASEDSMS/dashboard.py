@@ -1,4 +1,4 @@
-﻿from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import time
 
@@ -6,11 +6,17 @@ import cv2
 import pandas as pd
 import streamlit as st
 
-from main import process_frame
+from logic.logger import log_violation
+from logic.pipeline import process_frame
 
 
-LOG_PATH = Path("CVBASEDSMS/CVBASEDSMS/logs/violations.csv")
-VIDEO_PATH = Path("CVBASEDSMS/CVBASEDSMS/videos/test.mp4")
+BASE_DIR = Path(__file__).resolve().parent
+LOG_PATH = BASE_DIR / "logs" / "violations.csv"
+VIDEO_PATH = BASE_DIR / "videos" / "test.mp4"
+CAMERA_ID = "CAM_DASHBOARD"
+EVENT_CONFIRM_FRAMES = 5
+EVENT_COOLDOWN_SECONDS = 8
+EVENT_FORGET_FRAMES = 45
 
 
 st.set_page_config(page_title="KRUU Safety Monitor", layout="wide")
@@ -189,6 +195,60 @@ def load_violations():
     df = df.dropna(subset=["timestamp"])
     return df
 
+def log_confirmed_events(all_violations, alert):
+    if "event_state" not in st.session_state:
+        st.session_state.event_state = {}
+    st.session_state.frame_index = st.session_state.get("frame_index", 0) + 1
+
+    event_state = st.session_state.event_state
+    frame_index = st.session_state.frame_index
+    now = datetime.now()
+    current_event_ids = {v[3] for v in all_violations}
+
+    for event_id in current_event_ids:
+        state_item = event_state.get(
+            event_id, {"count": 0, "last_seen_frame": -1, "last_logged_at": None}
+        )
+        if state_item["last_seen_frame"] == frame_index - 1:
+            state_item["count"] += 1
+        else:
+            state_item["count"] = 1
+        state_item["last_seen_frame"] = frame_index
+        event_state[event_id] = state_item
+
+    stale_ids = [
+        event_id
+        for event_id, state_item in event_state.items()
+        if frame_index - state_item["last_seen_frame"] > EVENT_FORGET_FRAMES
+    ]
+    for event_id in stale_ids:
+        del event_state[event_id]
+
+    events_to_log = []
+    for event_id in current_event_ids:
+        state_item = event_state[event_id]
+        cooldown_done = (
+            state_item["last_logged_at"] is None
+            or (now - state_item["last_logged_at"]) >= timedelta(seconds=EVENT_COOLDOWN_SECONDS)
+        )
+        if state_item["count"] >= EVENT_CONFIRM_FRAMES and cooldown_done:
+            events_to_log.append(event_id)
+
+    if not events_to_log:
+        return
+
+    violations_to_log = [v for v in all_violations if v[3] in events_to_log]
+    if not violations_to_log:
+        return
+
+    log_violation(
+        camera_id=CAMERA_ID,
+        violations=violations_to_log,
+        severity=alert,
+    )
+    for event_id in events_to_log:
+        event_state[event_id]["last_logged_at"] = now
+
 
 def badge_for_alert(alert):
     if alert == "CRITICAL":
@@ -260,6 +320,7 @@ if not ret:
     st.stop()
 
 frame, alert, all_violations = process_frame(frame)
+log_confirmed_events(all_violations, alert)
 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
 st.markdown('<div class="page">', unsafe_allow_html=True)
@@ -375,4 +436,3 @@ else:
 
 time.sleep(0.03)
 st.rerun()
-
