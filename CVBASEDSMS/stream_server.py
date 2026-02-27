@@ -44,10 +44,15 @@ class StreamState:
             return self.alert, self.updated_at
 
 
-def frame_producer(video_path, fps, state, camera_id):
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Unable to open video: {video_path}")
+def frame_producer(source, fps, state, camera_id, mode):
+    if mode == "rtsp":
+        cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            raise RuntimeError(f"Unable to open RTSP stream: {source}")
+    else:
+        cap = cv2.VideoCapture(str(source))
+        if not cap.isOpened():
+            raise RuntimeError(f"Unable to open video: {source}")
 
     frame_interval = 1.0 / max(fps, 1)
     event_state = {}
@@ -56,7 +61,12 @@ def frame_producer(video_path, fps, state, camera_id):
         start = time.time()
         ret, frame = cap.read()
         if not ret:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            if mode == "file":
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+            cap.release()
+            time.sleep(1.0)
+            cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
             continue
 
         frame, alert, all_violations = process_frame(frame)
@@ -157,11 +167,18 @@ class StreamHandler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description="MJPEG stream server with detections")
+    parser.add_argument("--mode", choices=["file", "rtsp"], default="file")
     parser.add_argument(
         "--video_path",
         type=str,
         default=str(BASE_DIR / "videos" / "test.mp4"),
-        help="Path to video file",
+        help="Path to video file (mode=file)",
+    )
+    parser.add_argument(
+        "--rtsp_url",
+        type=str,
+        default="rtsp://localhost:8554/live",
+        help="RTSP URL (mode=rtsp)",
     )
     parser.add_argument("--camera_id", type=str, default="CAM_STREAM")
     parser.add_argument("--port", type=int, default=8000)
@@ -169,8 +186,11 @@ def main():
     args = parser.parse_args()
 
     state = StreamState()
+    source = args.video_path if args.mode == "file" else args.rtsp_url
     thread = threading.Thread(
-        target=frame_producer, args=(args.video_path, args.fps, state, args.camera_id), daemon=True
+        target=frame_producer,
+        args=(source, args.fps, state, args.camera_id, args.mode),
+        daemon=True,
     )
     thread.start()
 
